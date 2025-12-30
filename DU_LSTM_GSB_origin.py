@@ -72,7 +72,6 @@ def to_ising_ext(H: Tensor, y: Tensor, nbps: int, lmbd: Tensor):
     I = torch.eye(N, device=H.device)
     
     # Build transformation matrix T that maps bits to spins
-    # Each bit becomes a spin, weighted by its position in the symbol
     T = (2 ** (rb - 1 - torch.arange(rb, device=H.device)))[:, None, None] * I[None, ...]
     T = T.reshape(-1, N).T  # [N, rb*N]
     
@@ -90,18 +89,14 @@ def to_ising_ext(H: Tensor, y: Tensor, nbps: int, lmbd: Tensor):
     lmbd_val = lmbd if isinstance(lmbd, torch.Tensor) else torch.tensor([lmbd], device=H.device)
     U_λ = torch.linalg.inv(H_tilde @ H_tilde.T + (lmbd_val * torch.eye(2 * Nr, device=H.device))) / lmbd_val
     
-    # Transform channel matrix for bit-level representation
     H_tilde_T = H_tilde @ T  # [2*Nr, rb*N]
     
-    # Compute coupling matrix J (quadratic term in Ising Hamiltonian)
     J = - H_tilde_T.T @ U_λ @ H_tilde_T * (2.0 / qam_var)
-    J = J * (1.0 - torch.eye(J.shape[0], device=J.device))  # Zero diagonal (no self-coupling)
+    J = J * (1.0 - torch.eye(J.shape[0], device=J.device))  
     
-    # Compute bias vector h (linear term in Ising Hamiltonian)
     ones_rbN = torch.ones((J.shape[0], 1), device=H.device)
     ones_N = torch.ones((N, 1), device=H.device)
     
-    # Compute effective "field" based on received signal and constellation statistics
     z = (y_tilde.unsqueeze(1) - H_tilde_T @ ones_rbN + (math.sqrt(M) - 1) * (H_tilde @ ones_N)) / math.sqrt(qam_var)
     h = 2.0 * H_tilde_T.T @ (U_λ @ z)  # [rb*N, 1]
     
@@ -223,55 +218,26 @@ def generate_single_sample(num_tx_ant: int, num_rx_ant: int, SNR: int, num_bits_
     Note:
         Uses Sionna if available, otherwise falls back to random Gaussian.
     """
-    if _HAS_SIONNA:
-        # Use Sionna for realistic channel simulation
-        no = num_tx_ant / 10 ** (SNR / 10)  # Noise power
-        channel = FlatFadingChannel(num_tx_ant, num_rx_ant, add_awgn=True, return_channel=False)
-        h = channel._gen_chn(1)  # [1, Nr, Nt]
-        
-        # Generate QAM symbols and bits
-        qam_source = QAMSource(num_bits_per_symbol, return_bits=True)
-        x, bits = qam_source([1, num_tx_ant])
-        
-        # Apply channel
-        y = channel._app_chn([x, h, no])
-        
-        # Convert to numpy and squeeze batch dimension
-        h = h.numpy()
-        bits = bits.numpy()
-        y = y.numpy()
-        h = h.squeeze(0)
-        bits = bits.squeeze(0)
-        y = y.squeeze(0)
-        return h.astype(np.complex64), bits.astype(np.int32), y.astype(np.complex64)
-    else:
-        # Fallback: random Gaussian channel
-        Nr = num_rx_ant
-        Nt = num_tx_ant
-        
-        # Complex Gaussian channel (Rayleigh fading)
-        H = (np.random.randn(Nr, Nt) + 1j * np.random.randn(Nr, Nt)).astype(np.complex64) / math.sqrt(2)
-        
-        # Bits
-        bits = (np.random.rand(Nt, num_bits_per_symbol) > 0.5).astype(np.int32)
-        
-        # Simple symbol mapping
-        if num_bits_per_symbol >= 2:
-            symbols = (2 * (bits[:, 0] > 0) - 1) + 1j * (2 * (bits[:, 1] > 0) - 1)
-        else:
-            symbols = (2 * (bits[:, 0] > 0) - 1)
-        
-        if isinstance(symbols, np.ndarray) and symbols.ndim == 1:
-            x = symbols.astype(np.complex64)
-        else:
-            x = np.array(symbols, dtype=np.complex64)
-        
-        # Add AWGN
-        no = num_tx_ant / 10 ** (SNR / 10)
-        noise = np.sqrt(no / 2) * (np.random.randn(Nr) + 1j * np.random.randn(Nr))
-        y = H @ x + noise
-        
-        return H, bits, y
+    # Use Sionna for realistic channel simulation
+    no = num_tx_ant / 10 ** (SNR / 10)  # Noise power
+    channel = FlatFadingChannel(num_tx_ant, num_rx_ant, add_awgn=True, return_channel=False)
+    h = channel._gen_chn(1)  # [1, Nr, Nt]
+    
+    # Generate QAM symbols and bits
+    qam_source = QAMSource(num_bits_per_symbol, return_bits=True)
+    x, bits = qam_source([1, num_tx_ant])
+    
+    # Apply channel
+    y = channel._app_chn([x, h, no])
+    
+    # Convert to numpy and squeeze batch dimension
+    h = h.numpy()
+    bits = bits.numpy()
+    y = y.numpy()
+    h = h.squeeze(0)
+    bits = bits.squeeze(0)
+    y = y.squeeze(0)
+    return h.astype(np.complex64), bits.astype(np.int32), y.astype(np.complex64)
 
 # ----------------------------
 # Model: DU_GSB_LSTM
@@ -283,9 +249,9 @@ class DU_GSB_LSTM(nn.Module):
         self.batch_size = batch_size
         
         # Learnable global parameters
-        self.λ = Parameter(torch.tensor([25.0], dtype=torch.float32), requires_grad=True)  # Regularization
-        self.Δ_per_step = Parameter(torch.full((T,), 0.01, dtype=torch.float32))  # Step sizes
-        self.η_per_step = Parameter(torch.full((T,), 1.0, dtype=torch.float32))  # Learning rates
+        self.λ = Parameter(torch.tensor([25.0], dtype=torch.float32), requires_grad=True)  
+        self.Δ_per_step = Parameter(torch.full((T,), 0.01, dtype=torch.float32))  
+        self.η_per_step = Parameter(torch.full((T,), 1.0, dtype=torch.float32))  
         
         # LSTM controller for adaptive parameter generation
         self.lstm_controller = nn.LSTMCell(input_size=3, hidden_size=lstm_hidden)
@@ -305,7 +271,7 @@ class DU_GSB_LSTM(nn.Module):
         self.register_buffer('feat_std', torch.ones(3))
         self.initialized_norm = False
         
-        # Probability schedule for perturbation (annealing)
+        # Probability schedule for perturbation
         self.p = 1 - torch.exp(-5 * torch.linspace(0, 1, T))
         i_tensor = torch.arange(self.T, dtype=torch.float32)
         t = i_tensor / float(self.T)
@@ -388,15 +354,15 @@ class DU_GSB_LSTM(nn.Module):
             Δ_i = self.Δ_per_step[i].view(1, 1).to(H.device).expand(1, B)  # Step size
             η_i = self.η_per_step[i].view(1, 1).to(H.device).expand(1, B)  # Learning rate
             
-            # Adjust a, b parameters (subtract 1 for symmetry around 0)
+            # Adjust a, b parameters
             a_i = (ab_params[:, 0:1].T - 1.0)  # Perturbation strength [1, B]
             b_i = (ab_params[:, 1:2].T - 1.0)  # Velocity alignment parameter [1, B]
             
-            # Information sharing mechanism (attraction to global best)
+            # Information sharing mechanism
             step = i / float(self.T)
             gbest_diff = gbest - x  # [N, B]
             gbest_norm = torch.norm(gbest_diff, dim=0, keepdim=True)
-            decay_factor = (1 / (1 + gbest_norm)) * (1 - step)  # Annealed attraction
+            decay_factor = (1 / (1 + gbest_norm)) * (1 - step) 
             info_share_base = decay_factor * gbest_diff
             
             # Velocity alignment using cosine similarity
@@ -404,11 +370,11 @@ class DU_GSB_LSTM(nn.Module):
             soft_mask = torch.tanh(1000 * (cos_sim + b_i.squeeze(0)))  # [B]
             info_share_term = soft_mask.unsqueeze(0) * info_share_base  # [N, B]
             
-            # Update velocity memory (momentum)
-            alpha = 0.9 - 0.4 * step  # Annealed momentum
+            # Update velocity memory 
+            alpha = 0.9 - 0.4 * step  
             velocity_memory = alpha * velocity_memory + (1 - alpha) * info_share_term
             
-            # Dynamics update (gradient step + momentum)
+            # Dynamics update
             if h is None:
                 y_vel = y_vel + (-(1 - self.prob_table[i]) * x + η_i * c_0 * (J @ x) + velocity_memory) * Δ_i
             else:
@@ -417,7 +383,7 @@ class DU_GSB_LSTM(nn.Module):
             # Position update
             x = x + Δ_i * y_vel
             
-            # Stochastic perturbation (helps escape local minima)
+            # Stochastic perturbation 
             rand_mask = torch.rand_like(x) < self.prob_table[i]
             x = x - rand_mask * a_i
             
